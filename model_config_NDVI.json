@@ -1,0 +1,46 @@
+{
+    "model": {
+        "d_model": 512,
+        "n_head": 1,
+        "n_layers": 4,
+        "hidden_layers":1024,
+        "drop_prob": 0,
+        "tau": 0.1,
+        "SEQ_LEN": 24,
+        "output_window":3
+    },
+    "train": {
+        "BATCH_SIZE": 1024,
+        "TOTAL_ITERS": 300000,
+        "SAVE_FREQ": 1000,
+        "EVAL_FREQ": 1000,
+        "NC_FILE": "./Dataset/NLH_010_dataset.nc",
+        "OUT_DIR":"./Result/CausalResult_IterTrain_NDVI_desasonalized",
+        "PREDICTORS": ["total_precipitation_sum_deseasonalized", "GA_deseasonalized", "runoff_sum_deseasonalized"],
+        "TARGET": "NDVI_deseasonalized",
+        "AUX_PREDICTORS":  ["temperature_2m_deseasonalized", "LST_deseasonalized", "total_evaporation_sum_deseasonalized","SMrz_deseasonalized","SMs_deseasonalized","S_deseasonalized"],                "STATIC_VARS":["DEM"],
+        "PROCEED_DATA": "data_train_NDVI.npy",
+        "USE_GEO_ENCODING": false
+    },
+    "analyze": {
+        "deseasonalized": true,
+        "BATCH_SIZE": 128,
+        "NC_FILE":"./Dataset/NLH_010_dataset.nc",
+        "OUT_DIR":"./Result/CausalResult_IterTrain_NDVI_desasonalized",
+        "PREDICTORS": ["total_precipitation_sum_deseasonalized", "GA_deseasonalized", "runoff_sum_deseasonalized"],
+        "TARGET": "NDVI_deseasonalized",
+        "AUX_PREDICTORS":  ["temperature_2m_deseasonalized", "LST_deseasonalized", "total_evaporation_sum_deseasonalized","SMrz_deseasonalized","SMs_deseasonalized","S_deseasonalized"],                "STATIC_VARS":["DEM"],
+        "PROCEED_DATA": "data_train_NDVI.npy",
+        "KMeans_M": 3,
+        "KMeans_N": 4,
+        "model_path": "Result/CausalResult_IterTrain_NDVI_desasonalized/best_model_rmse_0.003224.pth"
+    },
+    "_comment": {
+        "PREDICTORS_description": "主要预测变量，参与因果发现 (PREDICTORS → TARGET)",
+        "TARGET_description": "目标变量，因果分析的结果变量", 
+        "AUX_PREDICTORS_description": "辅助时间序列变量，提供上下文信息，不参与因果发现",
+        "STATIC_VARS_description": "静态变量 (不随时间变化)，作为全局条件，不参与因果发现",
+        "fusion_method": "FiLM (Feature-wise Linear Modulation) - 参考 AAAI 2018"
+    }
+}
+

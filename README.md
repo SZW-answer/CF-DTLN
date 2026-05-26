@@ -1,0 +1,150 @@
+# CF-DTLN: Conditional Fusion Deep Temporal Lag Network
+
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)
+![PyTorch](https://img.shields.io/badge/PyTorch-1.10%2B-orange.svg)
+
+---
+## 💡 Framework Overview (What is CF-DTLN?)
+**CF-DTLN explicitly disentangles causal drivers from environmental background conditions using **FiLM-based Conditional Modulation Fusion**. By integrating **Lag-Aware Convolutions** and **Multivariate Causal Attention**, it strictly enforces temporal precedence to capture long-term memory. Finally, it utilizes **Layer-wise Relevance Propagation (LRP)** to back-trace and extract a quantified causal feature matrix, revealing both the exact *Causal Strength* of hydrological drivers and their *Optimal Response Lags*. In short, CF-DTLN is an AI engine that understands causality, recognizes distributed lags, and dynamically adapts to geographic contexts.
+
+---
+## 🖼️ Model Architecture
+
+<p align="center">
+  <img src="PaperFigure/Fig.1.png" alt="Model Architecture" width="900"/>
+</p>
+
+*Figure 1: The overall architecture of the CF-DTLN framework.*
+<p align="center">
+  <img src="PaperFigure/Fig.3.png" alt="Model Architecture" width="900"/>
+</p>
+
+*Figure 2: Causal-driven intensity and quantification.*
+<p align="center">
+
+## ✨ Key Features
+
+- **Multi-Variate Causal Attention**: Captures time-lagged and cross-variable causal dependencies without future leakage, utilizing causal convolutions and learnable causal masks.
+- **Auxiliary Fusion**: Integrates contextual climate variables (e.g., Temperature, LST) and static features (e.g., DEM) as boundary conditions via Feature-wise Linear Modulation, ensuring they assist prediction without confounding the primary causal discovery paths.
+- **Causal-Driven Intensity and Quantification**: LRP-Based Explanatory Attribution and Intensity Quantification.
+- **Native NetCDF Support**: Seamlessly processes large-scale `.nc` raster datasets, automating geographical grid extraction and temporal matching.
+
+## 📂 Project Structure
+
+```text
+CF-DTLN/
+├── Nets/                   # Core neural network modules (CausalFormer, FiLM, Attention)
+├── Optimizer/              # Custom optimizers (e.g., Muon)
+├── RRP/                    # Layer-wise Relevance Propagation for causal attribution
+├── Dataset/                # Directory for NetCDF (.nc) datasets
+├── Result/                 # Output directory for logs, models, and predictions
+├── PaperFigure/            # High-resolution figures and results from the paper
+├── model_config.json       # Configuration file for model hyperparameters
+├── trainNorm_GPU1.py       # Main training script (GPU optimized)
+├── Product.py              # Production Data, NC, and Drawings
+└── README.md               # Project documentation
+```
+
+## 🚀 Getting Started
+
+### 1. Prerequisites
+
+Make sure you have Python 3.8+ installed. Install the required dependencies:
+
+```bash
+pip install torch numpy pandas netCDF4 scikit-learn matplotlib tqdm joblib scipy
+```
+
+### 2. Configuration
+
+Adjust the model architecture, training hyperparameters, and variable lists in `model_config.json`. 
+
+Variables are split into categories based on their role:
+- **`PREDICTORS`**: Main causal drivers (e.g., Precipitation, Runoff).
+- **`TARGET`**: Target variable to predict (e.g., GOSIFGPP).
+- **`AUX_PREDICTORS`**: Contextual time-series variables (e.g., Temperature, LST) fused via FiLM.
+- **`STATIC_VARS`**: Non-temporal variables (e.g., DEM).
+
+### 3. Data Preparation and Pre-trained Weights
+
+- **Dataset**: Download the dataset used in this study from [Google Drive (Dataset)](https://drive.google.com/drive/folders/1uhKd9bLV0STThBY2oCAPzQohgOUrii6R?usp=drive_link). Place the NetCDF dataset into the `Dataset/` folder.
+- **Model Training Weights**: Pre-trained model weights are available at [Google Drive (Model Weights)](https://drive.google.com/drive/folders/1vmQ09UPTEiQyzCxvjfiybx8pjSJ4QImz?usp=drive_link).
+
+Ensure your dataset contains the variables defined in your configuration file.
+
+### 4. Training the Model
+
+Run the main training script to train CF-DTLN. The script automatically caches preprocessed `.npy` arrays for faster subsequent runs.
+
+```bash
+python trainNorm_GPU1.py
+```
+
+### 5. Inference and Causal Analysis
+
+After training, you can use `Product.py` to run spatial predictions and extract causal relevance scores across your study area.
+
+## 📈 GPP Gradient Descent Training Process
+
+The training of the **Gross Primary Production (GPP)** target relies on a robust dual-optimizer approach implemented in `trainNorm_GPU1.py`. This leverages the Muon (Newton-Schulz orthogonalized momentum) optimizer for internal projection layers alongside the AdamW optimizer for other parameters. This hybrid approach significantly stabilizes the gradient descent process and enhances convergence rates across complex temporal data. 
+
+<p align="center">
+  <img src="PaperFigure/Fig.5.png" alt="GPP Training and Ablation Results" width="800"/>
+</p>
+
+*Figure : Ablation results and predictive performance of the GPP gradient descent training.*
+<p align="center">
+  <img src="Result/CausalResult_IterTrain_GPP_desasonalized/training_validation_loss_zoom.png" alt="GPP Training and Ablation Results" width="800"/>
+</p>
+
+*Figure : loss in Training and Validation process.*
+<p align="center">
+  <img src="Result/CausalResult_IterTrain_GPP_desasonalized/training_validation_rmse_zoom.png" alt="GPP Training and Ablation Results" width="800"/>
+</p>
+<p align="center">
+  <img src="PaperFigure/C3.png" alt="Causal Results Map" width="900"/>
+</p>
+
+*Figure : Accuracy Verification.*
+
+## 📊 Results and Visualizations
+
+CF-DTLN maps out both high-precision predictions and robust causal networks across different geographical zones.
+
+<p align="center">
+  <img src="PaperFigure/Fig.7.png" alt="Causal Results Map" width="900"/>
+</p>
+<p align="center">
+  <img src="PaperFigure/Fig.8.png" alt="Causal Results Map" width="900"/>
+</p>
+<p align="center">
+  <img src="PaperFigure/Fig.9.png" alt="Causal Results Map" width="900"/>
+</p>
+<p align="center">
+  <img src="PaperFigure/Fig.14.png" alt="Causal Results Map" width="900"/>
+
+</p>
+
+*Spatial distribution of discovered causal relationships.*
+
+
+## 📜 License
+
+This project is licensed under the [MIT License](LICENSE).
+
+## 🙏 Acknowledgements
+This work code builds upon and references:
+- [CausalFormer](https://arxiv.org/abs/2406.16708) — Causal Transformer architecture and RRP methodology
+- [FiLM](https://arxiv.org/abs/1709.07871) — Feature-wise Linear Modulation (AAAI 2018)
+- [Muon Optimizer](https://github.com/KellerJordan/Muon) — Newton-Schulz orthogonalized momentum optimizer
+
+We would also like to acknowledge the providers of the multi-source Earth observation datasets utilized in this research:
+- [CSR GRACE/GRACE-FO](https://www2.csr.utexas.edu/) for Terrestrial Water Storage Anomaly data.
+- [NASA GES DISC](https://disc.gsfc.nasa.gov/datasets/) for GLDAS 2.1 products (SMA, SWEA, PCWA).
+- [NASA MODIS](https://modis.gsfc.nasa.gov/) for EVI and LST products.
+- [NOAA](https://www.ngdc.noaa.gov/) for the SRTM Digital Elevation Data.
+- [Wuhan University (WHU)](http://irsip.whu.edu.cn/resources/CLCD.php) for the CLCD Land Use/Land Cover dataset.
+- [GLEAM](https://www.gleam.eu/) for evaporation and soil moisture products.
+- [Copernicus Climate Change Service (C3S)](https://cds.climate.copernicus.eu/datasets/) for ERA5-Land monthly data.
+- [University of New Hampshire (UNH)](http://globalecology.unh.edu/) for the OCO-2 SIF-based GPP (GOSIF, GPP) products.
