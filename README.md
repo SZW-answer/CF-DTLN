@@ -70,6 +70,7 @@ Variables are split into categories based on their role:
 
 - **Dataset**: Download the dataset used in this study from [Google Drive (Dataset)](https://drive.google.com/drive/folders/1uhKd9bLV0STThBY2oCAPzQohgOUrii6R?usp=drive_link). Place the NetCDF dataset into the `Dataset/` folder.
 - **Model Training Weights**: Pre-trained model weights are available at [Google Drive (Model Weights)](https://drive.google.com/drive/folders/1vmQ09UPTEiQyzCxvjfiybx8pjSJ4QImz?usp=drive_link).
+- **Result and Mapping in Quantification of Lag and Intensity in Inland River Basins**: are available at [Google Drive (Model Weights)](https://drive.google.com/drive/folders/1vmQ09UPTEiQyzCxvjfiybx8pjSJ4QImz?usp=drive_link).
 
 Ensure your dataset contains the variables defined in your configuration file.
 
