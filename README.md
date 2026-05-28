@@ -95,12 +95,12 @@ The training of the **Gross Primary Production (GPP)** target relies on a robust
 
 *Figure : Ablation results and predictive performance of the GPP gradient descent training.*
 <p align="center">
-  <img src="Result/CausalResult_IterTrain_GPP_desasonalized/training_validation_loss_zoom.png" alt="GPP Training and Ablation Results" width="800"/>
+  <img src="Result/training_validation_loss_zoom.png" alt="GPP Training and Ablation Results" width="800"/>
 </p>
 
 *Figure : loss in Training and Validation process.*
 <p align="center">
-  <img src="Result/CausalResult_IterTrain_GPP_desasonalized/training_validation_rmse_zoom.png" alt="GPP Training and Ablation Results" width="800"/>
+  <img src="Result/training_validation_rmse_zoom.png" alt="GPP Training and Ablation Results" width="800"/>
 </p>
 <p align="center">
   <img src="PaperFigure/C3.png" alt="Causal Results Map" width="900"/>
