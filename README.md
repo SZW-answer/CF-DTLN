@@ -122,7 +122,7 @@ CF-DTLN maps out both high-precision predictions and robust causal networks acro
   <img src="PaperFigure/Fig.9.png" alt="Causal Results Map" width="900"/>
 </p>
 <p align="center">
-  <img src="PaperFigure/Fig.14.png" alt="Causal Results Map" width="900"/>
+  <img src="PaperFigure/ls.png" alt="Causal Results Map" width="900"/>
 
 </p>
 
