@@ -19,14 +19,209 @@ import os
 import warnings
 from tqdm import tqdm
 from abc import abstractmethod
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
 # 导入自定义模块
 from Nets import PredictModel, prepare_device
-from LRP import CausalExplainer, normalize_causal_scores, compute_lag
+from RRP import CausalExplainer, normalize_causal_scores, compute_lag
 # 读取配置文件（支持通过环境变量切换）
-CONFIG_PATH = os.environ.get("MODEL_CONFIG_PATH", "./model_config.json")
+CONFIG_PATH = os.environ.get("MODEL_CONFIG_PATH", "./model_config_EVI.json")
+ls_id =1
 with open(CONFIG_PATH, 'r') as f:
     config = json.load(f)
 print(f"加载配置文件: {CONFIG_PATH}")
+
+DEFAULT_LAG_SELECTION_CONFIG = {
+    "smooth_window": 3,
+    "plateau_rel_tol": 0,
+    "boundary_penalty":0.01,
+    "seasonal_lag_penalty":0,
+    "seasonal_period": 12,
+    "edge_guard": 1,
+    "min_raw_peak_fraction": 0.2,
+    "use_vegetation_lag_prior": True,
+    "vegetation_max_lag": 24,
+}
+
+LAG_SELECTION_CONFIG = {
+    **DEFAULT_LAG_SELECTION_CONFIG,
+    **config.get("analyze", {}).get("lag_selection", {})
+}
+
+LAG_DIAGNOSTIC_FIELDS = [
+    "raw_lag",
+    "lag_confidence",
+    "lag_peak_raw",
+    "lag_peak_adjusted",
+    "max_effective_lag",
+    "boundary_warning",
+    "raw_boundary_warning",
+    "seasonal_lag_warning",
+    "lag_selection_method",
+]
+
+
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name, default):
+    value = os.environ.get(name)
+    if value in (None, ""):
+        return int(default)
+    return int(value)
+
+
+def configure_torch_runtime():
+    """
+    Tune PyTorch CPU threading for long spatial interpretation runs.
+
+    Environment variables:
+    - DTLN_NUM_THREADS: intra-op CPU threads, default min(32, os.cpu_count()).
+    - DTLN_INTEROP_THREADS: inter-op threads, default 2.
+    """
+    if not _env_flag("DTLN_CONFIGURE_TORCH_THREADS", True):
+        return
+
+    cpu_count = os.cpu_count() or 1
+    num_threads = _env_int("DTLN_NUM_THREADS", min(32, cpu_count))
+    interop_threads = _env_int("DTLN_INTEROP_THREADS", 2)
+
+    try:
+        torch.set_num_threads(max(1, num_threads))
+    except Exception:
+        pass
+    try:
+        torch.set_num_interop_threads(max(1, interop_threads))
+    except Exception:
+        pass
+
+    print(
+        "PyTorch CPU threads: "
+        f"intra={torch.get_num_threads()}, "
+        f"interop={interop_threads} (requested)"
+    )
+
+
+_CAUSAL_WORKER_STATE = {}
+
+
+def _init_causal_point_worker(model_path, worker_threads):
+    state = _CAUSAL_WORKER_STATE
+    torch.set_num_threads(max(1, int(worker_threads)))
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
+    device = torch.device("cpu")
+    state["device"] = device
+
+    model = PredictModel(
+        state["model_cfg"],
+        d_model=state["base_config"]["model"]["d_model"],
+        n_head=state["base_config"]["model"]["n_head"],
+        n_layers=state["base_config"]["model"]["n_layers"],
+        ffn_hidden=state["base_config"]["model"]["hidden_layers"],
+        drop_prob=state["base_config"]["model"]["drop_prob"],
+        tau=state["base_config"]["model"]["tau"],
+        use_geo_encoding=state["use_geo_encoding"],
+        aux_series_num=state["aux_series_num"],
+        static_dim=state["static_dim"],
+    ).to(device)
+    checkpoint = torch.load(model_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    state["model"] = model
+
+
+def _causal_point_worker(point_idx):
+    state = _CAUSAL_WORKER_STATE
+    coords = state["coords"]
+    data = state["data"]
+    seq_len = state["seq_len"]
+    time_step = state["time_step"]
+    var_names = state["var_names"]
+    series_num = state["series_num"]
+    m = state["m"]
+    n = state["n"]
+    model = state["model"]
+    device = state["device"]
+    use_geo_encoding = state["use_geo_encoding"]
+
+    coord = coords[point_idx]
+    point_data = data[point_idx]
+    samples = []
+    for t in range(seq_len, point_data.shape[0] + 1):
+        samples.append(point_data[t - seq_len:t].reshape(seq_len, series_num, 1))
+
+    if len(samples) == 0:
+        return {
+            "point_result": {
+                "point_id": point_idx,
+                "lat": coord["lat"],
+                "lon": coord["lon"],
+                "lat_idx": coord["lat_idx"],
+                "lon_idx": coord["lon_idx"],
+                "causal_edges": [],
+                "num_edges": 0,
+            },
+            "valid": False,
+            "relA": None,
+            "relK": None,
+        }
+
+    input_tensor = torch.FloatTensor(np.array(samples)).to(device)
+    input_tensor.requires_grad = True
+
+    if use_geo_encoding:
+        batch_n = input_tensor.shape[0]
+        lat_tensor = torch.full((batch_n,), coord["lat"], dtype=torch.float32).to(device)
+        lon_tensor = torch.full((batch_n,), coord["lon"], dtype=torch.float32).to(device)
+    else:
+        lat_tensor, lon_tensor = None, None
+
+    point_relA = []
+    point_relK = []
+    try:
+        for interpreted_series in range(series_num):
+            relA, relK_aligned = generate_RRP_scores_all(
+                model,
+                input_tensor,
+                interpreted_series,
+                device,
+                debug=False,
+                lat=lat_tensor,
+                lon=lon_tensor,
+            )
+            relA_i = relA[interpreted_series].detach().cpu().numpy()
+            relK_i = relK_aligned.detach().cpu().numpy() if torch.is_tensor(relK_aligned) else relK_aligned
+            point_relA.append(relA_i)
+            point_relK.append(relK_i)
+
+        causal_edges = analyze_all_causes(point_relA, point_relK, m, n, time_step, var_names)
+        valid = True
+    except Exception as e:
+        causal_edges = []
+        valid = False
+
+    return {
+        "point_result": {
+            "point_id": point_idx,
+            "lat": coord["lat"],
+            "lon": coord["lon"],
+            "lat_idx": coord["lat_idx"],
+            "lon_idx": coord["lon_idx"],
+            "causal_edges": causal_edges,
+            "num_edges": len(causal_edges),
+        },
+        "valid": valid,
+        "relA": point_relA if valid else None,
+        "relK": point_relK if valid else None,
+    }
     
 def load_nc_data(file_path):
     print(f"正在读取netCDF文件: {file_path}")
@@ -633,7 +828,7 @@ def run_causal_analysis(model_path, nc_file, output_dir, predictors, target_var,
     
     # 2. 加载模型
     cfg = {
-        'n_gpu': 0, 
+        'n_gpu': ls_id, 
         'data_loader': {
             'args': {
                 'time_step': seq_len, 
@@ -645,7 +840,7 @@ def run_causal_analysis(model_path, nc_file, output_dir, predictors, target_var,
         }
     }
     
-    device = prepare_device(0)
+    device = prepare_device(ls_id)
     
     # 检测是否使用地理编码 (从配置文件读取)
     use_geo_encoding = config["train"].get("USE_GEO_ENCODING", False)
@@ -720,9 +915,9 @@ def run_causal_analysis(model_path, nc_file, output_dir, predictors, target_var,
             lat_tensor, lon_tensor = None, None
         
         try:
-            # 只对 TARGET 变量进行 LRP 分析
+            # 只对 TARGET 变量进行 RRP 分析
             # interpreted_series = t_idx (TARGET 的索引)
-            relA, relK_aligned = generate_LRP_scores(model, input_tensor, t_idx, device, lat=lat_tensor, lon=lon_tensor)
+            relA, relK_aligned = generate_RRP_scores(model, input_tensor, t_idx, device, lat=lat_tensor, lon=lon_tensor)
             
             # relA 形状: (series_num, series_num)
             # 提取对 TARGET 的因果分数: relA[t_idx] = 所有变量对 TARGET 的影响
@@ -803,6 +998,7 @@ def run_causal_analysis(model_path, nc_file, output_dir, predictors, target_var,
             'n_points': valid_points,
             'kmeans_m': m,
             'kmeans_n': n,
+            'lag_selection': _lag_selection_cfg(),
             'analysis_type': 'PREDICTORS → TARGET only'
         },
         'global_causal_graph': {
@@ -822,7 +1018,7 @@ def run_causal_analysis(model_path, nc_file, output_dir, predictors, target_var,
     if len(global_causal_edges) > 0:
         df_global = pd.DataFrame(global_causal_edges)
     else:
-        df_global = pd.DataFrame(columns=['cause_idx', 'cause_name', 'effect_idx', 'effect_name', 'lag', 'score'])
+        df_global = pd.DataFrame(columns=['cause_idx', 'cause_name', 'effect_idx', 'effect_name', 'lag', 'score'] + LAG_DIAGNOSTIC_FIELDS)
     df_global.to_csv(global_csv_path, index=False)
     print(f"全局因果图 CSV: {global_csv_path}")
     
@@ -830,7 +1026,7 @@ def run_causal_analysis(model_path, nc_file, output_dir, predictors, target_var,
     all_edges_data = []
     for pt in all_point_data:
         for edge in pt['causal_edges']:
-            all_edges_data.append({
+            edge_record = {
                 'point_id': pt['point_id'],
                 'lat': pt['lat'],
                 'lon': pt['lon'],
@@ -840,15 +1036,19 @@ def run_causal_analysis(model_path, nc_file, output_dir, predictors, target_var,
                 'effect_name': edge['effect_name'],
                 'lag': edge['lag'],
                 'score': edge.get('score', 0)
-            })
+            }
+            for field in LAG_DIAGNOSTIC_FIELDS:
+                edge_record[field] = edge.get(field)
+            all_edges_data.append(edge_record)
     
     points_csv_path = os.path.join(output_dir, 'point_causal_graphs.csv')
     if len(all_edges_data) > 0:
         df_points = pd.DataFrame(all_edges_data)
     else:
-        df_points = pd.DataFrame(columns=['point_id', 'lat', 'lon', 'cause_idx', 'cause_name', 'effect_idx', 'effect_name', 'lag', 'score'])
+        df_points = pd.DataFrame(columns=['point_id', 'lat', 'lon', 'cause_idx', 'cause_name', 'effect_idx', 'effect_name', 'lag', 'score'] + LAG_DIAGNOSTIC_FIELDS)
     df_points.to_csv(points_csv_path, index=False)
     print(f"点位因果图 CSV: {points_csv_path}")
+    save_lag_diagnostics(all_edges_data, output_dir, time_step, suffix="target")
     
     # 6.4 保存地理点统计信息
     points_summary = [{
@@ -927,6 +1127,7 @@ def run_causal_analysis_all(model_path, nc_file, output_dir, predictors, target_
     Returns:
         all_results: 因果分析结果字典
     """
+    configure_torch_runtime()
     os.makedirs(output_dir, exist_ok=True)
     
     print(f"{'='*60}")
@@ -977,7 +1178,7 @@ def run_causal_analysis_all(model_path, nc_file, output_dir, predictors, target_
     
     # 2. 加载模型
     cfg = {
-        'n_gpu': 0, 
+        'n_gpu': ls_id, 
         'data_loader': {
             'args': {
                 'time_step': seq_len, 
@@ -989,7 +1190,7 @@ def run_causal_analysis_all(model_path, nc_file, output_dir, predictors, target_
         }
     }
     
-    device = prepare_device(0)
+    device = prepare_device(ls_id)
     
     # 检测是否使用地理编码 (从配置文件读取)
     use_geo_encoding = config["train"].get("USE_GEO_ENCODING", False)
@@ -1033,76 +1234,129 @@ def run_causal_analysis_all(model_path, nc_file, output_dir, predictors, target_
     global_relK = [np.zeros((series_num, time_step)) for _ in range(series_num)]
     valid_points = 0
     
-    for point_idx in tqdm(range(len(coords)), desc="全变量因果分析"):
-        coord = coords[point_idx]
-        point_data = data[point_idx]  # (T, V)
-        
-        # 生成输入样本
-        samples = []
-        for t in range(seq_len, T + 1):
-            sample = point_data[t-seq_len:t].reshape(seq_len, V, 1)
-            samples.append(sample)
-        
-        if len(samples) == 0:
-            continue
-        
-        input_tensor = torch.FloatTensor(np.array(samples)).to(device)
-        # print(input_tensor.shape)
-        input_tensor.requires_grad = True
-        
-        # 准备坐标张量 (如果启用地理编码)
-        if use_geo_encoding:
-            batch_size = input_tensor.shape[0]
-            lat_tensor = torch.full((batch_size,), coord['lat'], dtype=torch.float32).to(device)
-            lon_tensor = torch.full((batch_size,), coord['lon'], dtype=torch.float32).to(device)
-        else:
-            lat_tensor, lon_tensor = None, None
-        
-        point_relA = []
-        point_relK = []
-        
-        try:
-            # 为每个目标变量生成因果分数
-            for interpreted_series in range(series_num):
-                # 第一个点的第一个目标变量启用调试输出
-                enable_debug = (point_idx == 0 and interpreted_series == 0)
-                relA, relK_aligned = generate_LRP_scores_all(model, input_tensor, interpreted_series, device, 
-                                                              debug=enable_debug, lat=lat_tensor, lon=lon_tensor)
-                
-                # relA[interpreted_series] = 所有变量对该变量的影响
-                relA_i = relA[interpreted_series].detach().cpu().numpy()  # (series_num,)
-                
-                if torch.is_tensor(relK_aligned):
-                    relK_i = relK_aligned.numpy()  # (series_num, time_step)
-                else:
-                    relK_i = relK_aligned
-                
-                point_relA.append(relA_i)
-                point_relK.append(relK_i)
-                
-                # 累加到全局
-                global_relA[interpreted_series] += relA_i
-                global_relK[interpreted_series] += relK_i
-            
-            valid_points += 1
-            
-            # 生成该点的全变量因果图
-            causal_edges = analyze_all_causes(point_relA, point_relK, m, n, time_step, var_names)
-            
-        except Exception as e:
-            print(f"  点 {point_idx} 处理失败: {e}")
-            causal_edges = []
-        
-        point_result = {
-            'point_id': point_idx,
-            'lat': coord['lat'],
-            'lon': coord['lon'],
-            'lat_idx': coord['lat_idx'],
-            'lon_idx': coord['lon_idx'],
-            'causal_edges': causal_edges,
-            'num_edges': len(causal_edges)
+    num_workers = _env_int("DTLN_NUM_WORKERS", config["analyze"].get("NUM_WORKERS", 1))
+    enable_experimental_mp = _env_flag("DTLN_ENABLE_EXPERIMENTAL_MULTIPROCESS", False)
+    if num_workers > 1 and not enable_experimental_mp:
+        print(
+            "DTLN_NUM_WORKERS 已设置，但多进程点位并行仍为实验功能；"
+            "当前改用稳定单进程。若要测试: DTLN_ENABLE_EXPERIMENTAL_MULTIPROCESS=1"
+        )
+    if num_workers > 1 and enable_experimental_mp and device.type == "cpu":
+        worker_threads = _env_int("DTLN_WORKER_THREADS", max(1, (os.cpu_count() or 1) // num_workers))
+        chunk_size = _env_int("DTLN_WORKER_CHUNKSIZE", 8)
+        print(
+            f"启用CPU多进程点位并行: workers={num_workers}, "
+            f"worker_threads={worker_threads}, chunksize={chunk_size}"
+        )
+
+        global _CAUSAL_WORKER_STATE
+        _CAUSAL_WORKER_STATE = {
+            "base_config": config,
+            "model_cfg": cfg,
+            "data": data,
+            "coords": coords,
+            "seq_len": seq_len,
+            "time_step": time_step,
+            "var_names": var_names,
+            "series_num": series_num,
+            "m": m,
+            "n": n,
+            "use_geo_encoding": use_geo_encoding,
+            "aux_series_num": len(aux_predictors) if aux_predictors else 0,
+            "static_dim": len(static_vars_list) if static_vars_list else 0,
         }
-        all_point_data.append(point_result)
+        ctx = mp.get_context("fork")
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            mp_context=ctx,
+            initializer=_init_causal_point_worker,
+            initargs=(model_path, worker_threads),
+        ) as executor:
+            iterator = executor.map(_causal_point_worker, range(len(coords)), chunksize=chunk_size)
+            for result in tqdm(iterator, total=len(coords), desc="全变量因果分析"):
+                all_point_data.append(result["point_result"])
+                if result["valid"]:
+                    valid_points += 1
+                    for interpreted_series in range(series_num):
+                        global_relA[interpreted_series] += result["relA"][interpreted_series]
+                        global_relK[interpreted_series] += result["relK"][interpreted_series]
+    else:
+        if num_workers > 1 and device.type != "cpu":
+            print("检测到非CPU设备，DTLN_NUM_WORKERS 多进程点位并行已禁用。")
+
+        for point_idx in tqdm(range(len(coords)), desc="全变量因果分析"):
+            coord = coords[point_idx]
+            point_data = data[point_idx]  # (T, V)
+            
+            # 生成输入样本
+            samples = []
+            for t in range(seq_len, T + 1):
+                sample = point_data[t-seq_len:t].reshape(seq_len, V, 1)
+                samples.append(sample)
+            
+            if len(samples) == 0:
+                continue
+            
+            input_tensor = torch.FloatTensor(np.array(samples)).to(device)
+            # print(input_tensor.shape)
+            input_tensor.requires_grad = True
+            
+            # 准备坐标张量 (如果启用地理编码)
+            if use_geo_encoding:
+                batch_size = input_tensor.shape[0]
+                lat_tensor = torch.full((batch_size,), coord['lat'], dtype=torch.float32).to(device)
+                lon_tensor = torch.full((batch_size,), coord['lon'], dtype=torch.float32).to(device)
+            else:
+                lat_tensor, lon_tensor = None, None
+            
+            point_relA = []
+            point_relK = []
+            
+            try:
+                # 为每个目标变量生成因果分数
+                for interpreted_series in range(series_num):
+                    enable_debug = (
+                        _env_flag("DTLN_DEBUG_FIRST_POINT", False)
+                        and point_idx == 0
+                        and interpreted_series == 0
+                    )
+                    relA, relK_aligned = generate_RRP_scores_all(model, input_tensor, interpreted_series, device, 
+                                                                  debug=enable_debug, lat=lat_tensor, lon=lon_tensor)
+                    
+                    # relA[interpreted_series] = 所有变量对该变量的影响
+                    relA_i = relA[interpreted_series].detach().cpu().numpy()  # (series_num,)
+                    
+                    if torch.is_tensor(relK_aligned):
+                        relK_i = relK_aligned.numpy()  # (series_num, time_step)
+                    else:
+                        relK_i = relK_aligned
+                    
+                    point_relA.append(relA_i)
+                    point_relK.append(relK_i)
+                    
+                    # 累加到全局
+                    global_relA[interpreted_series] += relA_i
+                    global_relK[interpreted_series] += relK_i
+                
+                valid_points += 1
+                
+                # 生成该点的全变量因果图
+                causal_edges = analyze_all_causes(point_relA, point_relK, m, n, time_step, var_names)
+                
+            except Exception as e:
+                print(f"  点 {point_idx} 处理失败: {e}")
+                causal_edges = []
+            
+            point_result = {
+                'point_id': point_idx,
+                'lat': coord['lat'],
+                'lon': coord['lon'],
+                'lat_idx': coord['lat_idx'],
+                'lon_idx': coord['lon_idx'],
+                'causal_edges': causal_edges,
+                'num_edges': len(causal_edges)
+            }
+            all_point_data.append(point_result)
     
     # 5. 计算全局因果图
     if valid_points > 0:
@@ -1127,6 +1381,7 @@ def run_causal_analysis_all(model_path, nc_file, output_dir, predictors, target_
             'n_points': valid_points,
             'kmeans_m': m,
             'kmeans_n': n,
+            'lag_selection': _lag_selection_cfg(),
             'analysis_type': 'ALL variables'
         },
         'global_causal_graph': {
@@ -1146,7 +1401,7 @@ def run_causal_analysis_all(model_path, nc_file, output_dir, predictors, target_
     if len(global_causal_edges) > 0:
         df_global = pd.DataFrame(global_causal_edges)
     else:
-        df_global = pd.DataFrame(columns=['cause_idx', 'cause_name', 'effect_idx', 'effect_name', 'lag', 'score'])
+        df_global = pd.DataFrame(columns=['cause_idx', 'cause_name', 'effect_idx', 'effect_name', 'lag', 'score'] + LAG_DIAGNOSTIC_FIELDS)
     df_global.to_csv(global_csv_path, index=False)
     print(f"全局因果图 CSV: {global_csv_path}")
     
@@ -1154,7 +1409,7 @@ def run_causal_analysis_all(model_path, nc_file, output_dir, predictors, target_
     all_edges_data = []
     for pt in all_point_data:
         for edge in pt['causal_edges']:
-            all_edges_data.append({
+            edge_record = {
                 'point_id': pt['point_id'],
                 'lat': pt['lat'],
                 'lon': pt['lon'],
@@ -1164,28 +1419,41 @@ def run_causal_analysis_all(model_path, nc_file, output_dir, predictors, target_
                 'effect_name': edge['effect_name'],
                 'lag': edge['lag'],
                 'score': edge.get('score', 0)
-            })
+            }
+            for field in LAG_DIAGNOSTIC_FIELDS:
+                edge_record[field] = edge.get(field)
+            all_edges_data.append(edge_record)
     
     points_csv_path = os.path.join(output_dir, 'point_causal_graphs_all.csv')
     if len(all_edges_data) > 0:
         df_points = pd.DataFrame(all_edges_data)
     else:
-        df_points = pd.DataFrame(columns=['point_id', 'lat', 'lon', 'cause_idx', 'cause_name', 'effect_idx', 'effect_name', 'lag', 'score'])
+        df_points = pd.DataFrame(columns=['point_id', 'lat', 'lon', 'cause_idx', 'cause_name', 'effect_idx', 'effect_name', 'lag', 'score'] + LAG_DIAGNOSTIC_FIELDS)
     df_points.to_csv(points_csv_path, index=False)
     print(f"点位因果图 CSV: {points_csv_path}")
+    save_lag_diagnostics(all_edges_data, output_dir, time_step, suffix="all")
     
+    save_global_plots = _env_flag("DTLN_SAVE_GLOBAL_PLOTS", True)
+    save_point_graphs = _env_flag("DTLN_SAVE_POINT_GRAPHS", False)
+    max_point_graphs = _env_int("DTLN_MAX_POINT_GRAPHS", 50)
+    save_point_jsons = _env_flag("DTLN_SAVE_POINT_JSONS", True)
+
     # 7. 可视化全变量因果图
-    if len(global_causal_edges) > 0:
+    if save_global_plots and len(global_causal_edges) > 0:
         plot_all_causal_graph(global_causal_edges, var_names, output_dir)
     
     # 8. 为每个点生成因果图和 JSON
     point_graphs_dir = os.path.join(output_dir, 'point_graphs')
     point_json_dir = os.path.join(output_dir, 'point_jsons')
-    os.makedirs(point_graphs_dir, exist_ok=True)
-    os.makedirs(point_json_dir, exist_ok=True)
-    print(f"\n正在为每个点生成因果图和 JSON...")
+    if save_point_graphs:
+        os.makedirs(point_graphs_dir, exist_ok=True)
+    if save_point_jsons:
+        os.makedirs(point_json_dir, exist_ok=True)
+    print(f"\n正在生成点位输出: JSON={save_point_jsons}, PNG={save_point_graphs}")
     
-    for pt in tqdm(all_point_data, desc="生成点位因果图"):
+    graph_count = 0
+    iterator_desc = "生成点位JSON/图" if save_point_graphs else "生成点位JSON"
+    for pt in tqdm(all_point_data, desc=iterator_desc):
         lat = pt['lat']
         lon = pt['lon']
         point_id = pt['point_id']
@@ -1196,32 +1464,41 @@ def run_causal_analysis_all(model_path, nc_file, output_dir, predictors, target_
         
         if len(causal_edges) > 0:
             # 绘制因果图
-            plot_point_all_causal_graph(
-                causal_edges, 
-                var_names, 
-                point_id,
-                lat,
-                lon,
-                point_graphs_dir
-            )
+            if save_point_graphs and graph_count < max_point_graphs:
+                plot_point_all_causal_graph(
+                    causal_edges,
+                    var_names,
+                    point_id,
+                    lat,
+                    lon,
+                    point_graphs_dir
+                )
+                graph_count += 1
             
             # 保存 JSON (以经纬度命名)
-            point_json = {
-                'point_id': point_id,
-                'lat': lat,
-                'lon': lon,
-                'lat_idx': pt['lat_idx'],
-                'lon_idx': pt['lon_idx'],
-                'coord_name': coord_name,
-                'num_edges': len(causal_edges),
-                'causal_edges': causal_edges
-            }
-            json_filename = f"{coord_name}.json"
-            with open(os.path.join(point_json_dir, json_filename), 'w', encoding='utf-8') as f:
-                json.dump(point_json, f, ensure_ascii=False, indent=2)
+            if save_point_jsons:
+                point_json = {
+                    'point_id': point_id,
+                    'lat': lat,
+                    'lon': lon,
+                    'lat_idx': pt['lat_idx'],
+                    'lon_idx': pt['lon_idx'],
+                    'coord_name': coord_name,
+                    'num_edges': len(causal_edges),
+                    'causal_edges': causal_edges
+                }
+                json_filename = f"{coord_name}.json"
+                with open(os.path.join(point_json_dir, json_filename), 'w', encoding='utf-8') as f:
+                    json.dump(point_json, f, ensure_ascii=False, indent=2)
     
-    print(f"点位因果图已保存到: {point_graphs_dir}")
-    print(f"点位 JSON 已保存到: {point_json_dir}")
+    if save_point_graphs:
+        print(f"点位因果图已保存到: {point_graphs_dir} (最多 {max_point_graphs} 张)")
+    else:
+        print("已跳过点位 PNG 绘图。如需开启: DTLN_SAVE_POINT_GRAPHS=1")
+    if save_point_jsons:
+        print(f"点位 JSON 已保存到: {point_json_dir}")
+    else:
+        print("已跳过点位 JSON。如需开启: DTLN_SAVE_POINT_JSONS=1")
     
     print(f"\n{'='*60}")
     print(f"全变量因果分析完成！")
@@ -1236,18 +1513,18 @@ def run_causal_analysis_all(model_path, nc_file, output_dir, predictors, target_
     }
 
 
-def generate_LRP_scores_all(model, input_data, interpreted_series, device, debug=False, 
+def generate_RRP_scores_all(model, input_data, interpreted_series, device, debug=False, 
                               lat=None, lon=None, aux_data=None, static_vars=None):
     """
-    为指定目标变量生成 LRP 因果分数
+    为指定目标变量生成 RRP 因果分数
     
     完全参考 code/CausalFormer/explainer/explainer.py
     论文: https://arxiv.org/html/2406.16708v1
     
     重要说明:
-    - LRP 只分析主要变量 (PREDICTORS) 之间的因果关系
+    - RRP 只分析主要变量 (PREDICTORS) 之间的因果关系
     - 辅助变量 (AUX_PREDICTORS, STATIC_VARS) 通过 FiLM 机制在模型内部处理
-    - 辅助变量不参与 LRP 因果分数的计算
+    - 辅助变量不参与 RRP 因果分数的计算
     
     Args:
         model: 模型
@@ -1283,7 +1560,7 @@ def generate_LRP_scores_all(model, input_data, interpreted_series, device, debug
     model.zero_grad()
     one_hot_sum.backward(retain_graph=True)
     
-    # 应用 LRP
+    # 应用 RRP
     model.relprop(one_hot_vector)
     
     relAs = []
@@ -1445,14 +1722,19 @@ def analyze_all_causes(relA_list, relK_list, m, n, time_step, var_names):
             threshold = np.mean(relA_i) + np.std(relA_i)
             for j in range(len(relA_i)):
                 if relA_i[j] > threshold and i != j:  # 排除自己对自己
-                    lag = compute_lag(relK_i, j, time_step)
+                    lag_info = compute_lag_details(
+                        relK_i, j, time_step,
+                        cause_name=var_names[j] if j < len(var_names) else f'Var_{j}',
+                        effect_name=var_names[i] if i < len(var_names) else f'Var_{i}'
+                    )
                     causal_edges.append({
                         'cause_idx': int(j),
                         'cause_name': var_names[j] if j < len(var_names) else f'Var_{j}',
                         'effect_idx': int(i),
                         'effect_name': var_names[i] if i < len(var_names) else f'Var_{i}',
-                        'lag': int(lag),
-                        'score': float(relA_i[j])
+                        'lag': int(lag_info['lag']),
+                        'score': float(relA_i[j]),
+                        **lag_info
                     })
         else:
             try:
@@ -1466,14 +1748,19 @@ def analyze_all_causes(relA_list, relK_list, m, n, time_step, var_names):
                 
                 for j in range(len(relA_i)):
                     if cluster_labels[j] in largest_m_clusters and i != j:  # 排除自己对自己
-                        lag = compute_lag(relK_i, j, time_step)
+                        lag_info = compute_lag_details(
+                            relK_i, j, time_step,
+                            cause_name=var_names[j] if j < len(var_names) else f'Var_{j}',
+                            effect_name=var_names[i] if i < len(var_names) else f'Var_{i}'
+                        )
                         causal_edges.append({
                             'cause_idx': int(j),
                             'cause_name': var_names[j] if j < len(var_names) else f'Var_{j}',
                             'effect_idx': int(i),
                             'effect_name': var_names[i] if i < len(var_names) else f'Var_{i}',
-                            'lag': int(lag),
-                            'score': float(relA_i[j])
+                            'lag': int(lag_info['lag']),
+                            'score': float(relA_i[j]),
+                            **lag_info
                         })
             except Exception as e:
                 pass
@@ -1779,14 +2066,19 @@ def analyze_target_causes(relA, relK, m, n, time_step, var_names, target_var, ta
         threshold = np.mean(relA) + np.std(relA)
         for j in range(series_num):
             if relA[j] > threshold:
-                lag = compute_lag(relK, j, time_step)
+                lag_info = compute_lag_details(
+                    relK, j, time_step,
+                    cause_name=var_names[j] if j < len(var_names) else f'Var_{j}',
+                    effect_name=target_var
+                )
                 causal_edges.append({
                     'cause_idx': int(j),
                     'cause_name': var_names[j] if j < len(var_names) else f'Var_{j}',
                     'effect_idx': int(target_idx),
                     'effect_name': target_var,
-                    'lag': int(lag),
-                    'score': float(relA[j])
+                    'lag': int(lag_info['lag']),
+                    'score': float(relA[j]),
+                    **lag_info
                 })
         return causal_edges
     
@@ -1803,14 +2095,19 @@ def analyze_target_causes(relA, relK, m, n, time_step, var_names, target_var, ta
         
         for j in range(series_num):
             if cluster_labels[j] in largest_m_clusters:
-                lag = compute_lag(relK, j, time_step)
+                lag_info = compute_lag_details(
+                    relK, j, time_step,
+                    cause_name=var_names[j] if j < len(var_names) else f'Var_{j}',
+                    effect_name=target_var
+                )
                 causal_edges.append({
                     'cause_idx': int(j),
                     'cause_name': var_names[j] if j < len(var_names) else f'Var_{j}',
                     'effect_idx': int(target_idx),
                     'effect_name': target_var,
-                    'lag': int(lag),
-                    'score': float(relA[j])
+                    'lag': int(lag_info['lag']),
+                    'score': float(relA[j]),
+                    **lag_info
                 })
     except Exception as e:
         print(f"  聚类失败: {e}")
@@ -1824,39 +2121,235 @@ def analyze_target_causes(relA, relK, m, n, time_step, var_names, target_var, ta
     return causal_edges
 
 
-def compute_lag(relK, j, time_step):
+def _lag_selection_cfg():
+    return {
+        **DEFAULT_LAG_SELECTION_CONFIG,
+        **config.get("analyze", {}).get("lag_selection", {}),
+    }
+
+
+def _is_vegetation_response(effect_name):
+    if not effect_name:
+        return False
+    name = str(effect_name).lower()
+    return any(token in name for token in ("gpp", "gosif", "sif", "evi", "ndvi", "fpar", "lai"))
+
+
+def _effective_max_lag(time_step, cause_name=None, effect_name=None):
+    cfg = _lag_selection_cfg()
+    max_lag = int(time_step) - 1
+    configured = cfg.get("max_effective_lag", None)
+    if configured is not None:
+        max_lag = min(max_lag, int(configured))
+    elif cfg.get("use_vegetation_lag_prior", True) and _is_vegetation_response(effect_name):
+        max_lag = min(max_lag, int(cfg.get("vegetation_max_lag", 12)))
+    return max(0, max_lag)
+
+
+def _smooth_lag_spectrum(values, window):
+    values = np.asarray(values, dtype=float)
+    window = int(window)
+    if window <= 1 or values.size < 3:
+        return values
+    window = min(window, values.size)
+    if window % 2 == 0:
+        window -= 1
+    if window <= 1:
+        return values
+    pad = window // 2
+    padded = np.pad(values, (pad, pad), mode="edge")
+    kernel = np.ones(window, dtype=float) / float(window)
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def compute_lag_details(relK, j, time_step, cause_name=None, effect_name=None):
     """
-    计算时间滞后 (参考 interpret.py 第79-80行)
-    
-    lag = time_step - 1 - argmax(|relK[j]|)
-    
-    使用绝对值的最大值，因为负因果（抑制作用）也是因果关系
-    
+    Compute a robust lag from the relevance spectrum.
+
+    The old implementation used a single argmax over |relK[j]|. That is
+    fragile for seasonal/autocorrelated ecological series because small
+    differences can push the peak to the maximum lag. This version smooths
+    the spectrum, applies a weak temporal-priority penalty, and picks the
+    shortest lag among near-optimal candidates.
+
     Args:
         relK: (series_num, time_step) 数组，或 torch.Tensor
         j: 原因变量索引
         time_step: 时间步数
+        cause_name: 原因变量名，用于输出诊断
+        effect_name: 结果变量名，用于生态滞后先验
     
     Returns:
-        lag: 时间滞后 (0 表示即时因果，time_step-1 表示最大滞后)
+        dict: lag 及其诊断信息
     """
+    fallback = {
+        "lag": 0,
+        "raw_lag": 0,
+        "lag_confidence": 0.0,
+        "lag_peak_raw": 0.0,
+        "lag_peak_adjusted": 0.0,
+        "max_effective_lag": max(0, int(time_step) - 1),
+        "boundary_warning": False,
+        "raw_boundary_warning": False,
+        "seasonal_lag_warning": False,
+        "lag_selection_method": "fallback_zero",
+    }
+
     try:
-        # 处理 torch.Tensor
         if torch.is_tensor(relK):
             relK = relK.detach().cpu().numpy()
-        
-        if isinstance(relK, np.ndarray) and relK.ndim == 2 and j < relK.shape[0]:
-            relK_j = relK[j]
+        elif isinstance(relK, list):
+            relK = np.array(relK)
+
+        if isinstance(relK, np.ndarray):
+            if relK.ndim == 2 and j < relK.shape[0]:
+                relK_j = np.asarray(relK[j], dtype=float)
+            elif relK.ndim == 1:
+                relK_j = np.asarray(relK, dtype=float)
+            else:
+                return fallback
+            relK_j = np.nan_to_num(relK_j, nan=0.0, posinf=0.0, neginf=0.0)
             if len(relK_j) > 0 and np.sum(np.abs(relK_j)) > 0:
-                # 使用绝对值找最大影响位置（包含正因果和负因果/抑制作用）
-                # 找到绝对值最大的索引
-                max_idx = np.argmax(np.abs(relK_j))
-                # lag = time_step - 1 - argmax_index (参考 interpret.py 第80行)
-                lag = time_step - 1 - max_idx
-                return max(0, int(lag))
+                cfg = _lag_selection_cfg()
+                strength_by_lag = np.abs(relK_j)[::-1]
+                max_effective_lag = _effective_max_lag(time_step, cause_name, effect_name)
+                max_effective_lag = min(max_effective_lag, len(strength_by_lag) - 1)
+
+                valid = strength_by_lag[:max_effective_lag + 1]
+                if valid.size == 0 or np.max(valid) <= 0:
+                    return fallback
+
+                smoothed = _smooth_lag_spectrum(valid, cfg.get("smooth_window", 3))
+                scale = float(np.max(smoothed))
+                normalized = smoothed / scale if scale > 0 else smoothed
+                raw_scale = float(np.max(valid))
+                raw_normalized = valid / raw_scale if raw_scale > 0 else valid
+
+                lags = np.arange(valid.size, dtype=float)
+                denom = max(1.0, float(max_effective_lag))
+                adjusted = normalized.copy()
+                adjusted -= float(cfg.get("boundary_penalty", 0.15)) * (lags / denom) ** 2
+
+                seasonal_period = int(cfg.get("seasonal_period", 12))
+                if seasonal_period > 0:
+                    seasonal_mask = (lags > 0) & ((lags % seasonal_period) == 0)
+                    adjusted[seasonal_mask] -= float(cfg.get("seasonal_lag_penalty", 0.08))
+
+                raw_lag = int(np.argmax(strength_by_lag))
+                raw_lag = min(raw_lag, int(time_step) - 1)
+                best_adjusted = float(np.max(adjusted))
+                plateau_tol = float(cfg.get("plateau_rel_tol", 0.05))
+                min_raw_fraction = float(cfg.get("min_raw_peak_fraction", 0.2))
+                candidates = np.where(
+                    (adjusted >= best_adjusted - plateau_tol)
+                    & (raw_normalized >= min_raw_fraction)
+                )[0]
+                lag = int(candidates[0]) if len(candidates) else int(np.argmax(adjusted))
+                selected_idx = min(lag, len(valid) - 1)
+
+                edge_guard = int(cfg.get("edge_guard", 1))
+                raw_boundary = raw_lag >= int(time_step) - 1 - edge_guard
+                boundary = lag >= max_effective_lag - edge_guard
+                seasonal_warning = seasonal_period > 0 and lag > 0 and lag % seasonal_period == 0
+                confidence = max(0.0, min(1.0, float(normalized[selected_idx])))
+
+                return {
+                    "lag": max(0, int(lag)),
+                    "raw_lag": max(0, int(raw_lag)),
+                    "lag_confidence": confidence,
+                    "lag_peak_raw": float(valid[selected_idx]),
+                    "lag_peak_adjusted": float(adjusted[selected_idx]),
+                    "max_effective_lag": int(max_effective_lag),
+                    "boundary_warning": bool(boundary),
+                    "raw_boundary_warning": bool(raw_boundary),
+                    "seasonal_lag_warning": bool(seasonal_warning),
+                    "lag_selection_method": "smoothed_shortest_near_peak",
+                }
     except Exception as e:
         pass
-    return 0
+    return fallback
+
+
+def compute_lag(relK, j, time_step, cause_name=None, effect_name=None):
+    """
+    Backward-compatible wrapper returning only the selected lag.
+    """
+    return compute_lag_details(relK, j, time_step, cause_name, effect_name)["lag"]
+
+
+def summarize_lag_diagnostics(edges, time_step):
+    """
+    Aggregate lag warnings by cause/effect pair.
+    """
+    summary = {}
+    for edge in edges:
+        key = (edge.get("cause_name", "unknown"), edge.get("effect_name", "unknown"))
+        if key not in summary:
+            summary[key] = {
+                "cause_name": key[0],
+                "effect_name": key[1],
+                "n_edges": 0,
+                "selected_boundary_count": 0,
+                "raw_boundary_count": 0,
+                "seasonal_lag_count": 0,
+                "lag_sum": 0.0,
+                "raw_lag_sum": 0.0,
+                "lag_counts": {},
+                "raw_lag_counts": {},
+            }
+        item = summary[key]
+        lag = int(edge.get("lag", 0))
+        raw_lag = int(edge.get("raw_lag", lag))
+        item["n_edges"] += 1
+        item["selected_boundary_count"] += int(bool(edge.get("boundary_warning", False)))
+        item["raw_boundary_count"] += int(bool(edge.get("raw_boundary_warning", False)))
+        item["seasonal_lag_count"] += int(bool(edge.get("seasonal_lag_warning", False)))
+        item["lag_sum"] += lag
+        item["raw_lag_sum"] += raw_lag
+        item["lag_counts"][str(lag)] = item["lag_counts"].get(str(lag), 0) + 1
+        item["raw_lag_counts"][str(raw_lag)] = item["raw_lag_counts"].get(str(raw_lag), 0) + 1
+
+    rows = []
+    for item in summary.values():
+        n_edges = max(1, item["n_edges"])
+        rows.append({
+            "cause_name": item["cause_name"],
+            "effect_name": item["effect_name"],
+            "n_edges": item["n_edges"],
+            "mean_lag": item["lag_sum"] / n_edges,
+            "mean_raw_lag": item["raw_lag_sum"] / n_edges,
+            "selected_boundary_ratio": item["selected_boundary_count"] / n_edges,
+            "raw_boundary_ratio": item["raw_boundary_count"] / n_edges,
+            "seasonal_lag_ratio": item["seasonal_lag_count"] / n_edges,
+            "lag_counts": item["lag_counts"],
+            "raw_lag_counts": item["raw_lag_counts"],
+        })
+    rows.sort(key=lambda x: (x["effect_name"], x["cause_name"]))
+    return rows
+
+
+def save_lag_diagnostics(edges, output_dir, time_step, suffix=""):
+    """
+    Save boundary/seasonal lag diagnostics used to detect unstable lag maps.
+    """
+    summary = summarize_lag_diagnostics(edges, time_step)
+    suffix_part = f"_{suffix}" if suffix else ""
+    json_path = os.path.join(output_dir, f"lag_diagnostics{suffix_part}.json")
+    csv_path = os.path.join(output_dir, f"lag_diagnostics{suffix_part}.csv")
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "lag_selection_config": _lag_selection_cfg(),
+            "time_step": int(time_step),
+            "summary": summary,
+        }, f, ensure_ascii=False, indent=2)
+
+    csv_rows = []
+    for row in summary:
+        csv_rows.append({k: v for k, v in row.items() if not isinstance(v, dict)})
+    pd.DataFrame(csv_rows).to_csv(csv_path, index=False)
+    print(f"Lag诊断 JSON: {json_path}")
+    print(f"Lag诊断 CSV: {csv_path}")
 
 
 def plot_target_causal_graph(causal_edges, var_names, target_var, output_dir):
@@ -2092,9 +2585,9 @@ def plot_point_causal_graph(causal_edges, var_names, target_var, point_id, lat, 
     plt.close()
 
 
-def generate_LRP_scores(model, input_data, interpreted_series, device, lat=None, lon=None):
+def generate_RRP_scores(model, input_data, interpreted_series, device, lat=None, lon=None):
     """
-    生成 LRP (Regression Relevance Propagation) 因果分数
+    生成 RRP (Regression Relevance Propagation) 因果分数
     
     完全参考 code/CausalFormer/explainer/explainer.py 和 interpret.py
     论文: https://arxiv.org/html/2406.16708v1
@@ -2131,7 +2624,7 @@ def generate_LRP_scores(model, input_data, interpreted_series, device, lat=None,
     model.zero_grad()
     one_hot_sum.backward(retain_graph=True)
     
-    # 应用 LRP (参考 explainer.py 第46行)
+    # 应用 RRP (参考 explainer.py 第46行)
     model.relprop(one_hot_vector)
     
     relAs = []
@@ -2245,24 +2738,20 @@ def analyze_causal_graph(relA, relK, m, n, time_step, var_names):
             threshold = np.mean(relA_i) + np.std(relA_i)
             for j in range(len(relA_i)):
                 if relA_i[j] > threshold:
-                    lag = 0
-                    if i < len(relK) and isinstance(relK[i], (list, np.ndarray)):
-                        relK_i = relK[i]
-                        if isinstance(relK_i, np.ndarray) and relK_i.ndim >= 1:
-                            if relK_i.ndim == 2 and j < relK_i.shape[0]:
-                                relK_ij = relK_i[j]
-                            elif relK_i.ndim == 1:
-                                relK_ij = relK_i
-                            else:
-                                relK_ij = np.zeros(time_step)
-                            if len(relK_ij) > 0 and np.sum(relK_ij) > 0:
-                                lag = time_step - 1 - np.argmax(relK_ij)
+                    lag_info = compute_lag_details(
+                        relK[i] if i < len(relK) else np.zeros((series_num, time_step)),
+                        j,
+                        time_step,
+                        cause_name=var_names[j] if j < len(var_names) else f'Var_{j}',
+                        effect_name=var_names[i] if i < len(var_names) else f'Var_{i}'
+                    )
                     causal_edges.append({
                         'cause_idx': int(j),
                         'cause_name': var_names[j] if j < len(var_names) else f'Var_{j}',
                         'effect_idx': int(i),
                         'effect_name': var_names[i] if i < len(var_names) else f'Var_{i}',
-                        'lag': int(max(0, lag))
+                        'lag': int(lag_info['lag']),
+                        **lag_info
                     })
         return causal_edges
     
@@ -2294,28 +2783,22 @@ def analyze_causal_graph(relA, relK, m, n, time_step, var_names):
             for j in range(len(relA_i)):
                 if cluster_labels[j] in largest_m_clusters:
                     # 从 relK 中获取时间滞后 (参考 interpret.py 第78-80行)
-                    lag = 0
+                    relK_for_lag = np.zeros((series_num, time_step))
                     if i < len(relK):
                         relK_i = relK[i]
                         if isinstance(relK_i, list):
-                            if j < len(relK_i):
-                                relK_ij = np.array(relK_i[j]) if not isinstance(relK_i[j], np.ndarray) else relK_i[j]
-                            else:
-                                relK_ij = np.zeros(time_step)
+                            relK_for_lag = np.array(relK_i)
                         elif isinstance(relK_i, np.ndarray):
-                            if relK_i.ndim == 2 and j < relK_i.shape[0]:
-                                relK_ij = relK_i[j]
-                            elif relK_i.ndim == 1:
-                                relK_ij = relK_i
-                            else:
-                                relK_ij = np.zeros(time_step)
-                        else:
-                            relK_ij = np.zeros(time_step)
-                        
-                        # 计算时间滞后 (参考 interpret.py 第79-80行)
-                        if len(relK_ij) > 0 and np.sum(relK_ij) > 0:
-                            indices = np.argsort(-1 * relK_ij)
-                            lag = time_step - 1 - indices[0]
+                            relK_for_lag = relK_i
+                    if isinstance(relK_for_lag, np.ndarray) and relK_for_lag.ndim == 1:
+                        relK_for_lag = np.tile(relK_for_lag.reshape(1, -1), (series_num, 1))
+                    lag_info = compute_lag_details(
+                        relK_for_lag,
+                        j,
+                        time_step,
+                        cause_name=var_names[j] if j < len(var_names) else f'Var_{j}',
+                        effect_name=var_names[i] if i < len(var_names) else f'Var_{i}'
+                    )
                     
                     # 添加因果边: (cause=j, effect=i, lag=t)
                     causal_edges.append({
@@ -2323,7 +2806,8 @@ def analyze_causal_graph(relA, relK, m, n, time_step, var_names):
                         'cause_name': var_names[j] if j < len(var_names) else f'Var_{j}',
                         'effect_idx': int(i),
                         'effect_name': var_names[i] if i < len(var_names) else f'Var_{i}',
-                        'lag': int(max(0, lag))
+                        'lag': int(lag_info['lag']),
+                        **lag_info
                     })
         except Exception as e:
             print(f"  聚类失败 (i={i}): {e}")

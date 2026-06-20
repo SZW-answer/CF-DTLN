@@ -15,7 +15,7 @@
         "SAVE_FREQ":5000,
         "EVAL_FREQ":500,
         "NC_FILE": "./Dataset/NLH_010_dataset.nc",
-        "OUT_DIR":"./Result/CausalResult_IterTrain_GPP_desasonalized",
+        "OUT_DIR":"./Result/CausalResult_IterTrain_GPP_desasonalized/",
         "PREDICTORS": ["total_precipitation_sum_deseasonalized", "GA_deseasonalized", "runoff_sum_deseasonalized"],
         "TARGET": "GOSIFGPP_deseasonalized",
         "AUX_PREDICTORS":  ["temperature_2m_deseasonalized", "LST_deseasonalized", "total_evaporation_sum_deseasonalized","FPAR_deseasonalized","SMrz_deseasonalized","SMs_deseasonalized","S_deseasonalized"],
@@ -25,7 +25,7 @@
     },
     "analyze": {
         "deseasonalized": true,
-        "BATCH_SIZE": 128,
+        "BATCH_SIZE": 512,
         "NC_FILE":"./Dataset/NLH_010_dataset.nc",
         "OUT_DIR":"./Result/CausalResult_IterTrain_GPP_desasonalized",
         "PREDICTORS": ["total_precipitation_sum_deseasonalized", "GA_deseasonalized", "runoff_sum_deseasonalized"],

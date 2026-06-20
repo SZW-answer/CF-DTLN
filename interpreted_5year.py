@@ -16,10 +16,10 @@ warnings.filterwarnings('ignore')
 
 # Defined time windows as per requirements
 PERIODS = [
-    ("2003_2004", 2003, 2004), # 24 months
-    ("2005_2009", 2005, 2009), # 60 months
-    ("2010_2014", 2010, 2014), # 60 months
-    ("2015_2019", 2015, 2019), # 60 months
+    ("2003_2004", 2003, 2005), # 24 months
+    ("2005_2009", 2005, 2010), # 60 months
+    ("2010_2014", 2010, 2015), # 60 months
+    ("2015_2019", 2015, 2020), # 60 months
     ("2020_2024", 2020, 2024)  # 60 months
 ]
 

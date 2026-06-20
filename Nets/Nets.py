@@ -5,6 +5,7 @@
 import torch
 import torch.nn as nn
 import math
+import os
 from abc import abstractmethod
 
 def custom_repr(self):
@@ -23,10 +24,15 @@ from RRP.RRP import (
 
 def prepare_device(n_gpu_use):
     """准备设备 (GPU 或 CPU)"""
+    if str(os.environ.get("DTLN_FORCE_CPU", "")).lower() in {"1", "true", "yes", "y", "on"}:
+        return torch.device("cpu")
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
     if n_gpu_use == 0:
         return torch.device('cuda:0')
-    elif n_gpu_use ==1:
+    elif n_gpu_use == 1:
         return torch.device('cuda:1')
+    return torch.device("cpu")
  
 
 
