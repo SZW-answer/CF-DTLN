@@ -25,8 +25,8 @@ import multiprocessing as mp
 from Nets import PredictModel, prepare_device
 from RRP import CausalExplainer, normalize_causal_scores, compute_lag
 # 读取配置文件（支持通过环境变量切换）
-CONFIG_PATH = os.environ.get("MODEL_CONFIG_PATH", "./model_config_EVI.json")
-ls_id =1
+CONFIG_PATH = os.environ.get("MODEL_CONFIG_PATH", "./model_config_SIF.json")
+ls_id =0
 with open(CONFIG_PATH, 'r') as f:
     config = json.load(f)
 print(f"加载配置文件: {CONFIG_PATH}")
@@ -142,6 +142,8 @@ def _causal_point_worker(point_idx):
     state = _CAUSAL_WORKER_STATE
     coords = state["coords"]
     data = state["data"]
+    aux_data = state.get("aux_data")
+    static_data = state.get("static_data")
     seq_len = state["seq_len"]
     time_step = state["time_step"]
     var_names = state["var_names"]
@@ -177,6 +179,21 @@ def _causal_point_worker(point_idx):
     input_tensor = torch.FloatTensor(np.array(samples)).to(device)
     input_tensor.requires_grad = True
 
+    aux_tensor = None
+    if aux_data is not None:
+        point_aux = aux_data[point_idx]
+        aux_samples = []
+        for t in range(seq_len, point_aux.shape[0] + 1):
+            aux_samples.append(point_aux[t - seq_len:t].reshape(seq_len, point_aux.shape[1], 1))
+        if aux_samples:
+            aux_tensor = torch.FloatTensor(np.array(aux_samples)).to(device)
+
+    static_tensor = None
+    if static_data is not None:
+        batch_n = input_tensor.shape[0]
+        static_point = np.asarray(static_data[point_idx], dtype=float)
+        static_tensor = torch.FloatTensor(np.repeat(static_point[None, :], batch_n, axis=0)).to(device)
+
     if use_geo_encoding:
         batch_n = input_tensor.shape[0]
         lat_tensor = torch.full((batch_n,), coord["lat"], dtype=torch.float32).to(device)
@@ -196,6 +213,8 @@ def _causal_point_worker(point_idx):
                 debug=False,
                 lat=lat_tensor,
                 lon=lon_tensor,
+                aux_data=aux_tensor,
+                static_vars=static_tensor,
             )
             relA_i = relA[interpreted_series].detach().cpu().numpy()
             relK_i = relK_aligned.detach().cpu().numpy() if torch.is_tensor(relK_aligned) else relK_aligned
@@ -599,8 +618,19 @@ def load_model_and_explain(model_path, config2, input_data, target_idx, var_name
     # 生成因果解释
     return generate_causal_explanation(model, input_data, target_idx, var_names, output_dir)
 
-def generate_causal_explanation(model, input_data, target_series_idx, var_names,
-                                 output_dir, batch_size=config["analyze"]["BATCH_SIZE"], save_plots=True):
+def generate_causal_explanation(
+    model,
+    input_data,
+    target_series_idx,
+    var_names,
+    output_dir,
+    batch_size=config["analyze"]["BATCH_SIZE"],
+    save_plots=True,
+    lat=None,
+    lon=None,
+    aux_data=None,
+    static_vars=None,
+):
     """
     独立的因果解释函数，可用于新数据点的推理
     
@@ -630,6 +660,10 @@ def generate_causal_explanation(model, input_data, target_series_idx, var_names,
     
     input_data = input_data.to(model.device)
     input_data.requires_grad = True
+    lat = lat.to(model.device) if torch.is_tensor(lat) else lat
+    lon = lon.to(model.device) if torch.is_tensor(lon) else lon
+    aux_data = aux_data.to(model.device) if torch.is_tensor(aux_data) else aux_data
+    static_vars = static_vars.to(model.device) if torch.is_tensor(static_vars) else static_vars
     
     print(f"\n{'='*60}")
     print(f"正在生成因果解释...")
@@ -638,11 +672,27 @@ def generate_causal_explanation(model, input_data, target_series_idx, var_names,
     print(f"{'='*60}")
     
     # 生成因果分数
-    relA, relK = explainer.generate_causal_scores(input_data, target_series_idx, batch_size)
+    relA, relK = explainer.generate_causal_scores(
+        input_data,
+        target_series_idx,
+        batch_size,
+        lat=lat,
+        lon=lon,
+        aux_data=aux_data,
+        static_vars=static_vars,
+    )
     
     # 解释因果图
     causal_results = explainer.interpret_causal_graph(
-        input_data, target_series_idx, var_names, batch_size, threshold=0.05
+        input_data,
+        target_series_idx,
+        var_names,
+        batch_size,
+        threshold=0.05,
+        lat=lat,
+        lon=lon,
+        aux_data=aux_data,
+        static_vars=static_vars,
     )
     
     # 打印因果关系
@@ -905,6 +955,21 @@ def run_causal_analysis(model_path, nc_file, output_dir, predictors, target_var,
         input_tensor = torch.FloatTensor(np.array(samples)).to(device)
         # print(input_tensor.shape)
         input_tensor.requires_grad = True
+
+        aux_tensor = None
+        if aux_data is not None:
+            point_aux = aux_data[point_idx]
+            aux_samples = []
+            for t in range(seq_len, point_aux.shape[0] + 1):
+                aux_samples.append(point_aux[t - seq_len:t].reshape(seq_len, point_aux.shape[1], 1))
+            if aux_samples:
+                aux_tensor = torch.FloatTensor(np.array(aux_samples)).to(device)
+
+        static_tensor = None
+        if static_data is not None:
+            batch_size_pt = input_tensor.shape[0]
+            static_point = np.asarray(static_data[point_idx], dtype=float)
+            static_tensor = torch.FloatTensor(np.repeat(static_point[None, :], batch_size_pt, axis=0)).to(device)
         
         # 准备坐标张量 (如果启用地理编码)
         if use_geo_encoding:
@@ -917,7 +982,16 @@ def run_causal_analysis(model_path, nc_file, output_dir, predictors, target_var,
         try:
             # 只对 TARGET 变量进行 RRP 分析
             # interpreted_series = t_idx (TARGET 的索引)
-            relA, relK_aligned = generate_RRP_scores(model, input_tensor, t_idx, device, lat=lat_tensor, lon=lon_tensor)
+            relA, relK_aligned = generate_RRP_scores(
+                model,
+                input_tensor,
+                t_idx,
+                device,
+                lat=lat_tensor,
+                lon=lon_tensor,
+                aux_data=aux_tensor,
+                static_vars=static_tensor,
+            )
             
             # relA 形状: (series_num, series_num)
             # 提取对 TARGET 的因果分数: relA[t_idx] = 所有变量对 TARGET 的影响
@@ -926,7 +1000,7 @@ def run_causal_analysis(model_path, nc_file, output_dir, predictors, target_var,
             # relK_aligned 形状: (series_num, time_step)
             # relK_aligned[j] = 变量 j 对 TARGET 的时间滞后分数
             if torch.is_tensor(relK_aligned):
-                relK_target = relK_aligned.numpy()  # (series_num, time_step)
+                relK_target = relK_aligned.detach().cpu().numpy()  # (series_num, time_step)
             else:
                 relK_target = relK_aligned
             
@@ -1254,6 +1328,8 @@ def run_causal_analysis_all(model_path, nc_file, output_dir, predictors, target_
             "base_config": config,
             "model_cfg": cfg,
             "data": data,
+            "aux_data": aux_data,
+            "static_data": static_data,
             "coords": coords,
             "seq_len": seq_len,
             "time_step": time_step,
@@ -1300,6 +1376,22 @@ def run_causal_analysis_all(model_path, nc_file, output_dir, predictors, target_
             input_tensor = torch.FloatTensor(np.array(samples)).to(device)
             # print(input_tensor.shape)
             input_tensor.requires_grad = True
+
+            aux_tensor = None
+            if aux_data is not None:
+                point_aux = aux_data[point_idx]
+                aux_samples = []
+                for t in range(seq_len, point_aux.shape[0] + 1):
+                    aux_sample = point_aux[t - seq_len:t].reshape(seq_len, point_aux.shape[1], 1)
+                    aux_samples.append(aux_sample)
+                if aux_samples:
+                    aux_tensor = torch.FloatTensor(np.array(aux_samples)).to(device)
+
+            static_tensor = None
+            if static_data is not None:
+                batch_size = input_tensor.shape[0]
+                static_point = np.asarray(static_data[point_idx], dtype=float)
+                static_tensor = torch.FloatTensor(np.repeat(static_point[None, :], batch_size, axis=0)).to(device)
             
             # 准备坐标张量 (如果启用地理编码)
             if use_geo_encoding:
@@ -1320,14 +1412,23 @@ def run_causal_analysis_all(model_path, nc_file, output_dir, predictors, target_
                         and point_idx == 0
                         and interpreted_series == 0
                     )
-                    relA, relK_aligned = generate_RRP_scores_all(model, input_tensor, interpreted_series, device, 
-                                                                  debug=enable_debug, lat=lat_tensor, lon=lon_tensor)
+                    relA, relK_aligned = generate_RRP_scores_all(
+                        model,
+                        input_tensor,
+                        interpreted_series,
+                        device,
+                        debug=enable_debug,
+                        lat=lat_tensor,
+                        lon=lon_tensor,
+                        aux_data=aux_tensor,
+                        static_vars=static_tensor,
+                    )
                     
                     # relA[interpreted_series] = 所有变量对该变量的影响
                     relA_i = relA[interpreted_series].detach().cpu().numpy()  # (series_num,)
                     
                     if torch.is_tensor(relK_aligned):
-                        relK_i = relK_aligned.numpy()  # (series_num, time_step)
+                        relK_i = relK_aligned.detach().cpu().numpy()  # (series_num, time_step)
                     else:
                         relK_i = relK_aligned
                     
@@ -2585,7 +2686,17 @@ def plot_point_causal_graph(causal_edges, var_names, target_var, point_id, lat, 
     plt.close()
 
 
-def generate_RRP_scores(model, input_data, interpreted_series, device, lat=None, lon=None):
+def generate_RRP_scores(
+    model,
+    input_data,
+    interpreted_series,
+    device,
+    lat=None,
+    lon=None,
+    aux_data=None,
+    static_vars=None,
+    debug=False,
+):
     """
     生成 RRP (Regression Relevance Propagation) 因果分数
     
@@ -2599,6 +2710,8 @@ def generate_RRP_scores(model, input_data, interpreted_series, device, lat=None,
         device: 设备
         lat: 纬度张量 (batch,) - 当模型启用地理编码时需要
         lon: 经度张量 (batch,) - 当模型启用地理编码时需要
+        aux_data: 辅助时序数据 - 当模型使用 FiLM 条件时需要
+        static_vars: 静态变量数据 - 当模型使用 FiLM 条件时需要
     
     Returns:
         relA: 注意力因果分数 (series_num, series_num)
@@ -2608,7 +2721,7 @@ def generate_RRP_scores(model, input_data, interpreted_series, device, lat=None,
     model.eval()
     
     # 前向传播
-    output = model(input_data, lat, lon)
+    output = model(input_data, lat, lon, aux_data, static_vars)
     
     # 创建 one-hot 张量 (参考 explainer.py 第35-36行)
     one_hot = torch.zeros_like(output, dtype=torch.float).to(device)
