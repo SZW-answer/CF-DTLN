@@ -180,48 +180,7 @@ class FiLM(BaseModel):
             gamma = gamma.unsqueeze(1)
             beta = beta.unsqueeze(1)
         
-        self.last_x = x
-        self.last_cond = cond
-        self.last_gamma = gamma
-        self.last_beta = beta
         return gamma * x + beta
-
-    def relprop(self, rel, return_cond=False):
-        """
-        Relevance propagation through FiLM modulation.
-
-        FiLM is y = gamma(cond) * x + beta(cond). For the core-variable
-        attribution used here, relevance is propagated back to the modulated
-        core feature x through the multiplicative gamma path. When requested,
-        a diagnostic condition relevance term is also returned, but auxiliary
-        variables are still not reported as causal graph nodes.
-        """
-        gamma = getattr(self, "last_gamma", None)
-        beta = getattr(self, "last_beta", None)
-        cond = getattr(self, "last_cond", None)
-        if gamma is None:
-            if return_cond:
-                return rel, None
-            return rel
-
-        gamma_safe = torch.where(gamma.abs() > 1e-6, gamma, torch.ones_like(gamma))
-        rel_x = rel * gamma_safe
-
-        rel_cond = None
-        if return_cond and cond is not None:
-            rel_cond = rel.detach()
-            while rel_cond.dim() > cond.dim():
-                rel_cond = rel_cond.sum(dim=1)
-            for dim, size in enumerate(cond.shape):
-                if size == 1 and rel_cond.shape[dim] != 1:
-                    rel_cond = rel_cond.sum(dim=dim, keepdim=True)
-            if rel_cond.shape[-1] != cond.shape[-1]:
-                rel_cond = rel_cond.sum(dim=-1, keepdim=True).expand_as(cond)
-            rel_cond = rel_cond.reshape(cond.shape) if rel_cond.numel() == cond.numel() else torch.zeros_like(cond)
-
-        if return_cond:
-            return rel_x, rel_cond
-        return rel_x
 
 
 class StaticEncoder(BaseModel):
@@ -837,52 +796,16 @@ class Encoder(BaseModel):
     def regularization(self):
         return sum([layer.regularization() for layer in self.layers]) / len(self.layers)
 
-    def _reduce_condition_relevance(self, rel, cond):
-        if rel is None or cond is None:
-            return None
-        while rel.dim() > cond.dim():
-            rel = rel.sum(dim=1)
-        for dim, size in enumerate(cond.shape):
-            if size == 1 and rel.shape[dim] != 1:
-                rel = rel.sum(dim=dim, keepdim=True)
-        if rel.shape != cond.shape:
-            if rel.numel() == cond.numel():
-                rel = rel.reshape(cond.shape)
-            else:
-                rel = torch.zeros_like(cond)
-        return rel
-
     def relprop(self, rel):
         """
         反向传播相关性
         
         注意: RRP 只对主要变量 (PREDICTORS) 进行因果分析
-        辅助变量通过 FiLM 条件化 forward 激活。relprop 显式穿过
-        FiLM 调制回到核心变量路径，但默认不把辅助变量作为因果图节点输出。
+        辅助变量通过 FiLM 条件化 forward 激活，但不作为 RRP 因果图节点。
+        这里仅在核心 encoder layers 内部进行 RRP，并按网络反向拓扑逆序传播。
         """
-        cond = getattr(self, "last_cond", None)
-        cond_rels = []
-
-        if self.has_aux and cond is not None:
-            rel, cond_rel = self.aux_fusion.film_encoder.relprop(rel, return_cond=True)
-            if cond_rel is not None:
-                cond_rel = self._reduce_condition_relevance(cond_rel, cond)
-                if cond_rel is not None:
-                    cond_rels.append(cond_rel)
-
-        emb_rel_total = None
         for layer in reversed(self.layers):
             emb_rel, rel = layer.relprop(rel)
-            emb_rel_total = emb_rel if emb_rel_total is None else emb_rel_total + emb_rel
-
-        if self.has_aux and cond is not None and emb_rel_total is not None:
-            _, cond_rel = self.aux_fusion.film_embed.relprop(emb_rel_total, return_cond=True)
-            if cond_rel is not None:
-                cond_rel = self._reduce_condition_relevance(cond_rel, cond)
-                if cond_rel is not None:
-                    cond_rels.append(cond_rel)
-
-        self.condition_rel = sum(cond_rels) if cond_rels else None
         return rel
 
 
