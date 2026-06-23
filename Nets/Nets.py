@@ -782,7 +782,6 @@ class Encoder(BaseModel):
         if self.has_aux:
             cond = self.aux_fusion.encode_conditions(aux_data, static_vars)
             embedding = self.aux_fusion.modulate_embedding(embedding, cond)
-        self.last_cond = cond
         
         for layer in self.layers:
             x = layer(embedding, x)
@@ -801,10 +800,9 @@ class Encoder(BaseModel):
         反向传播相关性
         
         注意: RRP 只对主要变量 (PREDICTORS) 进行因果分析
-        辅助变量通过 FiLM 条件化 forward 激活，但不作为 RRP 因果图节点。
-        这里仅在核心 encoder layers 内部进行 RRP，并按网络反向拓扑逆序传播。
+        辅助变量的 FiLM 调制不参与 RRP 计算，确保因果关系的纯净性
         """
-        for layer in reversed(self.layers):
+        for layer in self.layers:
             emb_rel, rel = layer.relprop(rel)
         return rel
 
