@@ -17,10 +17,12 @@ import json
 import math
 import os
 import warnings
+import gc
 from tqdm import tqdm
 from abc import abstractmethod
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
+import joblib
 # 导入自定义模块
 from Nets import PredictModel, prepare_device
 from RRP import CausalExplainer, normalize_causal_scores, compute_lag
@@ -107,6 +109,75 @@ def configure_torch_runtime():
 
 
 _CAUSAL_WORKER_STATE = {}
+
+
+def _scaler_model_dir(model_path):
+    if model_path:
+        return os.path.dirname(model_path) or "."
+    return config.get("analyze", {}).get("OUT_DIR", ".")
+
+
+def _load_training_scaler(model_path, filename, expected_features, label):
+    path = os.path.join(_scaler_model_dir(model_path), filename)
+    if not os.path.exists(path):
+        print(f"  [Scaler Warning] 未找到训练 {label} scaler: {path}")
+        return None
+    try:
+        scaler = joblib.load(path)
+    except Exception as exc:
+        print(f"  [Scaler Warning] 加载训练 {label} scaler 失败: {path} ({exc})")
+        return None
+
+    n_features = getattr(scaler, "n_features_in_", expected_features)
+    if int(n_features) != int(expected_features):
+        print(
+            f"  [Scaler Warning] 训练 {label} scaler 维度不匹配: "
+            f"expected={expected_features}, scaler={n_features}"
+        )
+        return None
+
+    print(f"  使用训练 {label} scaler: {path}")
+    return scaler
+
+
+def standardize_inference_data(data, aux_data, static_data, model_path):
+    """Use trainNorm_GPU1.py saved MinMaxScalers for inference."""
+    N, T, V = data.shape
+    raw_main = data.reshape(-1, V)
+    scaler = _load_training_scaler(model_path, "scaler.pkl", V, "main")
+    if scaler is None:
+        print("  [Scaler Warning] 主变量 fallback: 当前推理数据 fit_transform")
+        scaler = MinMaxScaler(feature_range=(0.1, 1))
+        scaled_main = scaler.fit_transform(raw_main)
+    else:
+        scaled_main = scaler.transform(raw_main)
+    data = scaled_main.reshape(N, T, V)
+
+    if aux_data is not None:
+        V_aux = aux_data.shape[2]
+        raw_aux = aux_data.reshape(-1, V_aux)
+        aux_scaler = _load_training_scaler(model_path, "aux_scaler.pkl", V_aux, "aux")
+        if aux_scaler is None:
+            print("  [Scaler Warning] 辅助变量 fallback: 当前推理数据 fit_transform")
+            aux_scaler = MinMaxScaler(feature_range=(0.1, 1))
+            scaled_aux = aux_scaler.fit_transform(raw_aux)
+        else:
+            scaled_aux = aux_scaler.transform(raw_aux)
+        aux_data = scaled_aux.reshape(N, T, V_aux)
+
+    if static_data is not None:
+        raw_static = np.asarray(static_data, dtype=float)
+        static_scaler = _load_training_scaler(
+            model_path, "static_scaler.pkl", raw_static.shape[1], "static"
+        )
+        if static_scaler is None:
+            print("  [Scaler Warning] 静态变量 fallback: 当前推理数据 fit_transform")
+            static_scaler = MinMaxScaler(feature_range=(0.1, 1))
+            static_data = static_scaler.fit_transform(raw_static)
+        else:
+            static_data = static_scaler.transform(raw_static)
+
+    return data, aux_data, static_data
 
 
 def _init_causal_point_worker(model_path, worker_threads):
@@ -810,21 +881,9 @@ def run_causal_analysis(model_path, nc_file, output_dir, predictors, target_var,
     print(f"目标变量 '{target_var}' 索引: {t_idx}")
     print(f"地理点数量: {len(coords)}")
     
-    # 标准化主数据
-    scaler = MinMaxScaler(feature_range=(0.1, 1))
+    # 标准化：使用 trainNorm_GPU1.py 训练阶段保存的 scaler，避免推理窗口重新 fit。
+    data, aux_data, static_data = standardize_inference_data(data, aux_data, static_data, model_path)
     N, T, V = data.shape
-    data = scaler.fit_transform(data.reshape(-1, V)).reshape(N, T, V)
-    
-    # 标准化辅助数据
-    if aux_data is not None:
-        aux_scaler = MinMaxScaler(feature_range=(0.1, 1))
-        V_aux = aux_data.shape[2]
-        aux_data = aux_scaler.fit_transform(aux_data.reshape(-1, V_aux)).reshape(N, T, V_aux)
-    
-    # 标准化静态数据
-    if static_data is not None:
-        static_scaler = MinMaxScaler(feature_range=(0.1, 1))
-        static_data = static_scaler.fit_transform(static_data)
     
     # 2. 加载模型
     cfg = {
@@ -1160,21 +1219,9 @@ def run_causal_analysis_all(model_path, nc_file, output_dir, predictors, target_
     print(f"变量列表: {var_names}")
     print(f"地理点数量: {len(coords)}")
     
-    # 标准化主数据
-    scaler = MinMaxScaler(feature_range=(0.1, 1))
+    # 标准化：使用 trainNorm_GPU1.py 训练阶段保存的 scaler，避免推理窗口重新 fit。
+    data, aux_data, static_data = standardize_inference_data(data, aux_data, static_data, model_path)
     N, T, V = data.shape
-    data = scaler.fit_transform(data.reshape(-1, V)).reshape(N, T, V)
-    
-    # 标准化辅助数据
-    if aux_data is not None:
-        aux_scaler = MinMaxScaler(feature_range=(0.1, 1))
-        V_aux = aux_data.shape[2]
-        aux_data = aux_scaler.fit_transform(aux_data.reshape(-1, V_aux)).reshape(N, T, V_aux)
-    
-    # 标准化静态数据
-    if static_data is not None:
-        static_scaler = MinMaxScaler(feature_range=(0.1, 1))
-        static_data = static_scaler.fit_transform(static_data)
     
     # 2. 加载模型
     cfg = {
@@ -1506,11 +1553,45 @@ def run_causal_analysis_all(model_path, nc_file, output_dir, predictors, target_
     print(f"发现 {len(global_causal_edges)} 个因果关系")
     print(f"{'='*60}")
     
-    return {
-        'global_causal_graph': global_causal_edges,
-        'point_causal_graphs': all_point_data,
-        'var_names': var_names
-    }
+    return_full_results = _env_flag("DTLN_RETURN_FULL_RESULTS", False)
+    if return_full_results:
+        result = {
+            'global_causal_graph': global_causal_edges,
+            'point_causal_graphs': all_point_data,
+            'var_names': var_names
+        }
+    else:
+        result = {
+            'global_edge_count': len(global_causal_edges),
+            'point_count': len(all_point_data),
+            'valid_points': valid_points,
+            'var_names': var_names
+        }
+
+    # Long all-basin runs repeatedly call this function. Explicitly drop GPU
+    # model/checkpoint references and large CPU containers before returning.
+    try:
+        del model, checkpoint
+    except Exception:
+        pass
+    if not return_full_results:
+        try:
+            del all_point_data, all_edges_data, global_relA, global_relK, global_causal_edges
+        except Exception:
+            pass
+    try:
+        del data, aux_data, static_data, coords
+    except Exception:
+        pass
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+    return result
 
 
 def generate_RRP_scores_all(model, input_data, interpreted_series, device, debug=False, 
@@ -2585,7 +2666,7 @@ def plot_point_causal_graph(causal_edges, var_names, target_var, point_id, lat, 
     plt.close()
 
 
-def generate_RRP_scores(model, input_data, interpreted_series, device, lat=None, lon=None):
+def generate_RRP_scores(model, input_data, interpreted_series, device, lat=None, lon=None, debug=False):
     """
     生成 RRP (Regression Relevance Propagation) 因果分数
     
